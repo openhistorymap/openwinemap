@@ -1,0 +1,3 @@
+data/countries/*.geojson linguist-generated=true -diff
+data/regions.geojson linguist-generated=true -diff
+data/manifest.json linguist-generated=true
