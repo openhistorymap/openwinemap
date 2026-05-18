@@ -76,6 +76,7 @@ const MAP_STYLES = {
 };
 
 const SOURCE_ID = "owm-pois";
+const AREAS_SOURCE_ID = "owm-areas";
 
 const state = {
   manifest: null,
@@ -147,16 +148,27 @@ function addGlyphImage(name, d, fill, halo) {
 }
 
 function addCustomLayers() {
+  const split = splitFeatures(filteredFeatures());
+
   if (!map.getSource(SOURCE_ID)) {
     map.addSource(SOURCE_ID, {
       type: "geojson",
-      data: featureCollection(filteredFeatures()),
+      data: featureCollection(split.points),
       cluster: true,
       clusterRadius: 50,
       clusterMaxZoom: 11,
     });
   } else {
-    map.getSource(SOURCE_ID).setData(featureCollection(filteredFeatures()));
+    map.getSource(SOURCE_ID).setData(featureCollection(split.points));
+  }
+
+  if (!map.getSource(AREAS_SOURCE_ID)) {
+    map.addSource(AREAS_SOURCE_ID, {
+      type: "geojson",
+      data: featureCollection(split.areas),
+    });
+  } else {
+    map.getSource(AREAS_SOURCE_ID).setData(featureCollection(split.areas));
   }
 
   const palette = currentPalette();
@@ -164,6 +176,41 @@ function addCustomLayers() {
   const clusterStroke = readVarColor("--map-cluster-stroke");
   const clusterText = readVarColor("--map-cluster-text");
   const dotStroke = state.theme === "dark" ? "rgba(20,12,12,0.7)" : "rgba(255,250,240,0.85)";
+
+  // Polygon fill + outline must go *under* the symbol/circle layers so the
+  // glyphs sit on top of their footprint. MapLibre inserts layers above all
+  // existing ones unless you pass a `before` id, so add fills first then
+  // re-add the point layers if they're missing.
+  if (!map.getLayer("owm-areas-fill")) {
+    map.addLayer({
+      id: "owm-areas-fill",
+      type: "fill",
+      source: AREAS_SOURCE_ID,
+      paint: {
+        "fill-color": colorExpr(palette),
+        "fill-opacity": [
+          "interpolate", ["linear"], ["zoom"],
+          6, 0.10, 10, 0.22, 14, 0.32, 18, 0.40,
+        ],
+      },
+    });
+    map.addLayer({
+      id: "owm-areas-outline",
+      type: "line",
+      source: AREAS_SOURCE_ID,
+      paint: {
+        "line-color": colorExpr(palette),
+        "line-width": [
+          "interpolate", ["linear"], ["zoom"],
+          8, 0.4, 12, 0.8, 16, 1.3, 18, 1.8,
+        ],
+        "line-opacity": 0.85,
+      },
+    });
+  } else {
+    map.setPaintProperty("owm-areas-fill", "fill-color", colorExpr(palette));
+    map.setPaintProperty("owm-areas-outline", "line-color", colorExpr(palette));
+  }
 
   if (!map.getLayer("owm-points-dot")) {
     map.addLayer({
@@ -274,11 +321,25 @@ function wireMapEvents() {
   });
 
   map.on("click", (e) => {
-    const hits = map.queryRenderedFeatures(e.point, { layers: ["owm-points", "owm-points-dot"] });
-    if (hits.length) openDetail(hits[0]);
+    // Symbols / dots win over polygon fills when both are under the cursor
+    // (the user almost always means "open the winery I just tapped" rather
+    // than "open the vineyard it sits inside").
+    const ptHits = map.queryRenderedFeatures(e.point, { layers: ["owm-points", "owm-points-dot"] });
+    if (ptHits.length) { openDetail(ptHits[0]); return; }
+    const areaHits = map.queryRenderedFeatures(e.point, { layers: ["owm-areas-fill"] });
+    if (areaHits.length) {
+      // The rendered area feature lacks the centroid we use in the symbol
+      // layer; look it up by id so the detail panel gets the full record
+      // including the `tags` blob.
+      const id = areaHits[0].properties && (areaHits[0].properties.osm_type
+        ? `${areaHits[0].properties.osm_type}/${areaHits[0].properties.osm_id}`
+        : areaHits[0].id);
+      const full = state.features.find((x) => x.id === id) || areaHits[0];
+      openDetail(full);
+    }
   });
 
-  for (const id of ["owm-points", "owm-points-dot", "owm-clusters"]) {
+  for (const id of ["owm-points", "owm-points-dot", "owm-clusters", "owm-areas-fill"]) {
     map.on("mouseenter", id, () => (map.getCanvas().style.cursor = "pointer"));
     map.on("mouseleave", id, () => (map.getCanvas().style.cursor = ""));
   }
@@ -297,6 +358,52 @@ function filteredFeatures() {
     for (const f of state.regions) out.push(f);
   }
   return out;
+}
+
+// Split the filtered feature set into the two MapLibre sources we maintain:
+// a clustered point source (one Point per feature — centroid for polygons)
+// and an unclustered polygon source for fill rendering. Centroids are an
+// unweighted mean of vertex coordinates — good enough for symbol placement;
+// not a geodesic centroid.
+function splitFeatures(features) {
+  const points = [];
+  const areas = [];
+  for (const f of features) {
+    const g = f.geometry;
+    if (!g) continue;
+    if (g.type === "Point") {
+      points.push(f);
+      continue;
+    }
+    areas.push(f);
+    const c = polygonCentroid(g);
+    if (c) {
+      points.push({
+        type: "Feature",
+        id: f.id,
+        geometry: { type: "Point", coordinates: c },
+        properties: f.properties,
+      });
+    }
+  }
+  return { points, areas };
+}
+
+function polygonCentroid(geom) {
+  const rings = [];
+  if (geom.type === "Polygon") {
+    for (const r of geom.coordinates) rings.push(r);
+  } else if (geom.type === "MultiPolygon") {
+    for (const poly of geom.coordinates) for (const r of poly) rings.push(r);
+  } else {
+    return null;
+  }
+  let sx = 0, sy = 0, n = 0;
+  for (const r of rings) {
+    for (const [x, y] of r) { sx += x; sy += y; n++; }
+  }
+  if (!n) return null;
+  return [sx / n, sy / n];
 }
 
 function normalizeCat(c) {
@@ -508,12 +615,19 @@ async function loadCountry(code, { skipFit = false, pushHistory = false } = {}) 
 function fitToCountry() {
   if (!state.features.length) return;
   let minLon = Infinity, minLat = Infinity, maxLon = -Infinity, maxLat = -Infinity;
-  for (const f of state.features) {
-    const [lon, lat] = f.geometry.coordinates;
+  const accept = ([lon, lat]) => {
     if (lon < minLon) minLon = lon;
     if (lon > maxLon) maxLon = lon;
     if (lat < minLat) minLat = lat;
     if (lat > maxLat) maxLat = lat;
+  };
+  const walk = (coords) => {
+    if (typeof coords[0] === "number") accept(coords);
+    else for (const c of coords) walk(c);
+  };
+  for (const f of state.features) {
+    if (!f.geometry) continue;
+    walk(f.geometry.coordinates);
   }
   if (!isFinite(minLon)) return;
   map.fitBounds(
@@ -570,7 +684,10 @@ function inlineGlyph(k) {
 function applyFilter() {
   const src = map.getSource(SOURCE_ID);
   if (!src) return;
-  src.setData(featureCollection(filteredFeatures()));
+  const split = splitFeatures(filteredFeatures());
+  src.setData(featureCollection(split.points));
+  const areas = map.getSource(AREAS_SOURCE_ID);
+  if (areas) areas.setData(featureCollection(split.areas));
 }
 
 // ── Detail panel ──────────────────────────────────────────────

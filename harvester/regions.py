@@ -1,14 +1,32 @@
 """Wine-region harvest from Wikidata.
 
-We treat 'wine region' broadly: protected appellations (AOC / DOC / DOCG /
-DOP / AVA), generic wine regions (Q19623897), wine-producing areas
-(Q3839081 — French vineyard AOC, etc.), and individually-named vineyards
-(Q39780) that have a Wikidata entry. Every feature is a point (centroid
-P625) — polygon boundaries are out of scope for v1.
+Every QID below is one we've live-verified with a known instance before
+shipping. Don't add a new class without doing the same — guessing in this
+file once turned the map into a memorial to twentieth-century disasters
+(see feedback memory).
 
-We query one class at a time because the WDQS subclass walk
-(`wdt:P31/wdt:P279*`) on the broad classes can time out when chained with
-optional joins. Per-class queries stay comfortably under the 60s limit.
+We treat 'wine region' broadly: protected appellations (AOC / DOC / DOCG /
+AOP), American Viticultural Areas, generic wine-producing regions
+(Q2140699 — covers Bordeaux, Burgundy, California wine, Tuscany, etc.),
+and generic legally-defined appellations (Q2858704). Every feature is a
+point (centroid P625) — polygon boundaries for wine regions are out of
+scope for v1; OSM provides those where they exist.
+
+We deliberately exclude:
+  * Q13439060 (EU PDO) and Q3104453 (EU PGI) — they cover cheese, oil,
+    ham and dozens of other products, so a subclass walk pulls in
+    Parmigiano Reggiano and Manchego alongside the wines.
+  * Q325668 (generic designation of origin) — same problem, wider.
+  * Q22715 (vineyard) and Q156362 (winery) — these are concrete
+    facilities, not regions. OSM already covers them via `landuse=vineyard`
+    and `craft=winery`.
+
+We query one class at a time and use `wdt:P31` (direct instance-of) rather
+than `wdt:P31/wdt:P279*` (subclass walk). Subclass walks are how the
+disaster mess happened: if any branch of the subclass tree leads somewhere
+unexpected, you silently inherit it. Direct-only queries trade a little
+recall for a guarantee that every result is a real instance of the class
+we asked for.
 """
 
 import time
@@ -16,25 +34,24 @@ import time
 from .wikidata import WdqsTimeout, parse_point, qid_from_uri, query, rows, val
 
 
+# (display_name, Wikidata QID, English label of the class — kept inline as a
+# self-documenting sanity check)
 WINE_REGION_CLASSES = [
-    ("wine_region",          "Q19623897"),
-    ("appellation",          "Q1755236"),
-    ("viticultural_area",    "Q1471806"),
-    ("ava",                  "Q1660525"),
-    ("doc",                  "Q372145"),
-    ("docg",                 "Q1542597"),
-    ("pdo",                  "Q2334195"),
-    ("pgi",                  "Q838948"),
-    ("aoc",                  "Q3044918"),
-    ("aoc_vineyard",         "Q3839081"),
-    ("vineyard",             "Q39780"),
-    ("wine_growing_estate",  "Q1758856"),
+    ("wine_region",        "Q2140699",  "wine-producing region"),
+    ("ava",                "Q166247",   "American Viticultural Area"),
+    ("aoc",                "Q1565828",  "appellation d'origine contrôlée"),
+    ("doc",                "Q654824",   "denominazione di origine controllata"),
+    ("docg",               "Q2305591",  "DOCG"),
+    ("aop_ch",             "Q20723149", "appellation d'origine protégée (CH)"),
+    ("appellation",        "Q2858704",  "appellation (legally-defined)"),
 ]
 
 
+# Plain instance-of, no subclass walk. The OPTIONAL joins for image, parent
+# region and Wikipedia article are the same shape as openartmap's queries.
 REGION_QUERY = """\
 SELECT DISTINCT ?r ?rLabel ?coord ?cc ?image ?parent ?parentLabel ?article WHERE {
-  ?r wdt:P31/wdt:P279* wd:%(class_qid)s .
+  ?r wdt:P31 wd:%(class_qid)s .
   ?r wdt:P625 ?coord .
   OPTIONAL { ?r wdt:P17/wdt:P297 ?cc }
   OPTIONAL { ?r wdt:P18 ?image }
@@ -88,8 +105,10 @@ def harvest_class(class_name, class_qid):
 def harvest_regions():
     all_regions = {}
     failed = []
-    for class_name, class_qid in WINE_REGION_CLASSES:
-        print(f"  region class: {class_name} ({class_qid})", flush=True)
+    for entry in WINE_REGION_CLASSES:
+        class_name, class_qid = entry[0], entry[1]
+        class_label = entry[2] if len(entry) > 2 else ""
+        print(f"  region class: {class_name} ({class_qid}) — {class_label}", flush=True)
         try:
             chunk = harvest_class(class_name, class_qid)
             new_count = 0

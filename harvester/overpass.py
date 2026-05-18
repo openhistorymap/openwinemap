@@ -7,6 +7,9 @@ MIRRORS = [
     "https://overpass.private.coffee/api/interpreter",
 ]
 
+# `out tags geom` returns the full polygon/multipolygon geometry inline for
+# ways and relations, not just a centroid. We need that so the frontend can
+# render the actual vineyard / winery footprints rather than dots.
 QUERY = """
 [out:json][timeout:900];
 area["ISO3166-1"="{cc}"][admin_level=2]->.a;
@@ -21,7 +24,7 @@ area["ISO3166-1"="{cc}"][admin_level=2]->.a;
   nwr["shop"="wine"](area.a);
   nwr["cuisine"="wine"](area.a);
 );
-out tags center;
+out tags geom;
 """
 
 

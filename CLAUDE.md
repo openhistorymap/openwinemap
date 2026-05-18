@@ -5,8 +5,8 @@ A weekly-refreshed wine atlas: wineries, vineyards and tasting rooms from OpenSt
 ## Layout
 
 - `harvester/` — Python module. Run with `python -m harvester`. Two passes:
-  1. **OSM per country.** Overpass query for `craft=winery`, `industrial=winery`, `building=winery`, `landuse=vineyard`, `tourism|man_made=wine_cellar`, `amenity=wine_bar`, `shop=wine`, `cuisine=wine`. Polygons reduced to centres. Writes `data/countries/{CC}.geojson` and per-country entries into `data/manifest.json`.
-  2. **Wikidata global.** SPARQL per wine-region class (wine region, appellation, AOC/DOC/DOCG/PDO/PGI/AVA, viticultural area, named vineyard, wine-growing estate). Centroids only (P625). Writes `data/regions.geojson`.
+  1. **OSM per country.** Overpass query for `craft=winery`, `industrial=winery`, `building=winery`, `landuse=vineyard`, `tourism|man_made=wine_cellar`, `amenity=wine_bar`, `shop=wine`, `cuisine=wine`. Geometries preserved as Point / Polygon / MultiPolygon (nodes → Point, closed ways → Polygon, `type=multipolygon` relations → MultiPolygon, one outer ring per polygon; inner rings dropped). Coordinates rounded to 5 dp (~1 m). Writes `data/countries/{CC}.geojson` and per-country entries into `data/manifest.json`.
+  2. **Wikidata global.** SPARQL per verified wine-region class (only seven, all live-verified against known instances — see `harvester/regions.py` for the curated list and the bans on PDO/PGI/generic-DO/vineyard/winery classes that would pull in cheese, ham, individual wineries, etc.). **Direct `wdt:P31` only, never `P279*`** — a single bad class with a subclass walk once swept 9k disasters into the file. Centroids only (P625). Writes `data/regions.geojson`.
 - `web/` — Static MapLibre frontend. No build step; deployed as-is to Pages. Includes `CNAME` for `openwinemap.org`.
 - `data/` — Generated. Treat as machine-owned output; do not hand-edit.
 - `.github/workflows/weekly.yml` — Sundays 02:00 UTC + manual dispatch. Harvests, commits data back to `main`, then publishes `web/ + data/` to GitHub Pages.
@@ -16,7 +16,9 @@ A weekly-refreshed wine atlas: wineries, vineyards and tasting rooms from OpenSt
 
 Two layered datasets, both rendered into the same MapLibre source so the cluster math accounts for them together.
 
-**OSM features** (per-country files) carry `osm_type`, `osm_id`, a normalised `category` (one of `winery`, `vineyard`, `wine_cellar`, `wine_bar`, `wine_shop`), `name`, optional `wikidata`/`wikipedia` strings, and a `tags` dict trimmed to the keys we display in the detail panel. Vineyards are kept only if they have a `name` or a wiki link — raw unnamed `landuse=vineyard` polygons are noise.
+**OSM features** (per-country files) carry `osm_type`, `osm_id`, a normalised `category` (one of `winery`, `vineyard`, `wine_cellar`, `wine_bar`, `wine_shop`), `name`, optional `wikidata`/`wikipedia` strings, and a `tags` dict trimmed to the keys we display in the detail panel. Geometry is one of `Point` / `Polygon` / `MultiPolygon` matching the OSM element type. Vineyards are kept only if they have a `name` or a wiki link — raw unnamed `landuse=vineyard` polygons are noise.
+
+The frontend splits each country's FeatureCollection client-side: Points and polygon centroids feed the clustered symbol source; polygons feed a separate fill/outline source. A polygon click falls back to the symbol layer when one is under the cursor, so a winery dot inside a vineyard polygon still opens the winery card.
 
 **Wikidata regions** (one global file) carry `qid`, `name`, an array `classes` (which Wikidata wine-region classes this item matched — a region may be both an appellation and a PDO), `country` (ISO 3166-1 alpha-2), `parent_qid`/`parent_name` (P361 part-of), an English `wikipedia` URL when present, and a Commons `image` URL. Wines associated with the region are NOT pre-fetched — the frontend resolves them on demand via a UNION SPARQL across P495 / P276 / P361 / P5826 / P127 plus the region's own P527 has-parts, filtered to `?w wdt:P31/wdt:P279* wd:Q282` (subclasses of wine). This keeps the harvester tractable and lets us surface the connection without committing to a single property model.
 

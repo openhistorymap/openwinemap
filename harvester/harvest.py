@@ -2,7 +2,11 @@
 
 Two sources:
   1. OpenStreetMap (per country, via Overpass) — wineries, vineyards,
-     wine cellars, wine bars, wine shops. Polygons are reduced to centres.
+     wine cellars, wine bars, wine shops. Geometries are preserved: nodes
+     become Points, closed ways become Polygons, type=multipolygon
+     relations become MultiPolygons (one outer ring per Polygon — we don't
+     attempt to merge shared edges; that's a problem for the basemap, not
+     for us). Coordinates are rounded to 5 decimal places (~1 m).
      Output: data/countries/{CC}.geojson
   2. Wikidata (global) — wine regions, appellations, named vineyards, all
      reduced to a single point (P625 centroid). Output: data/regions.geojson
@@ -47,12 +51,90 @@ KEEP_TAGS = {
 }
 
 
-def coords(el):
-    if el["type"] == "node":
-        return [el["lon"], el["lat"]]
-    c = el.get("center")
-    if c:
-        return [c["lon"], c["lat"]]
+COORD_PRECISION = 5  # decimal degrees; 5 dp ~= 1.1 m at the equator
+
+
+def _round_pair(p):
+    return [round(p[0], COORD_PRECISION), round(p[1], COORD_PRECISION)]
+
+
+def _ring_from_geometry(geom):
+    """Overpass `out geom` returns geometry as `[{"lat":.., "lon":..}, ...]`.
+    Convert to a list of [lon, lat] pairs. Empty / too-short lists are caller
+    problems."""
+    return [[g["lon"], g["lat"]] for g in geom]
+
+
+def _close_ring(coords):
+    if len(coords) >= 3 and coords[0] != coords[-1]:
+        coords.append(coords[0])
+    return coords
+
+
+def _ring_area(ring):
+    """Shoelace signed area in lon/lat space. Sign tells us winding; magnitude
+    lets us drop degenerate slivers and reject sub-millimetre vineyards we
+    pulled in by accident."""
+    n = len(ring)
+    if n < 4:
+        return 0.0
+    s = 0.0
+    for i in range(n - 1):
+        s += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1]
+    return s / 2.0
+
+
+def osm_geometry(el):
+    """Convert one Overpass `out tags geom` element to a GeoJSON geometry.
+    Returns None for shapes we can't render (open ways, empty relations)."""
+    t = el["type"]
+    if t == "node":
+        lon = el.get("lon")
+        lat = el.get("lat")
+        if lon is None or lat is None:
+            return None
+        return {"type": "Point", "coordinates": _round_pair([lon, lat])}
+    if t == "way":
+        geom = el.get("geometry") or []
+        if len(geom) < 2:
+            return None
+        coords = [_round_pair(p) for p in _ring_from_geometry(geom)]
+        if coords[0] == coords[-1] and len(coords) >= 4:
+            return {"type": "Polygon", "coordinates": [coords]}
+        # Open way — for our wine query that's almost always a vineyard
+        # boundary that wasn't closed by the mapper, OR a wine route. We
+        # synthesize closure rather than drop it, since the OSM convention
+        # for `landuse=*` is implicit closure.
+        if len(coords) >= 3:
+            return {"type": "Polygon", "coordinates": [_close_ring(coords)]}
+        return None
+    if t == "relation":
+        # We treat each outer-role way as its own polygon. Real OSM
+        # multipolygons can have shared edges across multiple way members;
+        # assembling those is out of scope (boundary topology is the
+        # basemap's job, not ours). Inner rings (holes) are dropped — for
+        # vineyards they almost never matter.
+        polys = []
+        for m in el.get("members", []):
+            if m.get("type") != "way":
+                continue
+            if m.get("role") not in ("outer", "", None):
+                continue
+            mg = m.get("geometry") or []
+            if len(mg) < 3:
+                continue
+            coords = [_round_pair(p) for p in _ring_from_geometry(mg)]
+            coords = _close_ring(coords)
+            if len(coords) < 4:
+                continue
+            if abs(_ring_area(coords)) < 1e-10:
+                continue
+            polys.append([coords])
+        if not polys:
+            return None
+        if len(polys) == 1:
+            return {"type": "Polygon", "coordinates": polys[0]}
+        return {"type": "MultiPolygon", "coordinates": polys}
     return None
 
 
@@ -73,8 +155,8 @@ def to_feature(el):
     if cat == "vineyard":
         if not (tags.get("name") or tags.get("wikidata") or tags.get("wikipedia")):
             return None
-    lonlat = coords(el)
-    if not lonlat:
+    geometry = osm_geometry(el)
+    if not geometry:
         return None
     props = {
         "osm_type": el["type"],
@@ -89,7 +171,7 @@ def to_feature(el):
     return {
         "type": "Feature",
         "id": f"{el['type']}/{el['id']}",
-        "geometry": {"type": "Point", "coordinates": lonlat},
+        "geometry": geometry,
         "properties": props,
     }
 
