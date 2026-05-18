@@ -36,6 +36,13 @@ from .wikidata import WdqsTimeout, parse_point, qid_from_uri, query, rows, val
 
 # (display_name, Wikidata QID, English label of the class — kept inline as a
 # self-documenting sanity check)
+#
+# Wikidata models specific appellations inconsistently. Many famous regions
+# are tagged Q22715 (vineyard) rather than as a region class — Saint-Émilion
+# AOC, Pauillac, Médoc, Margaux all live under that class. Including Q22715
+# is what brings hundreds of French AOC areas into the file. The trade-off
+# is that Q22715 also covers single-plot vineyards (which OSM already
+# carries) — but those rarely have a Wikidata P625, so they self-filter out.
 WINE_REGION_CLASSES = [
     ("wine_region",        "Q2140699",  "wine-producing region"),
     ("ava",                "Q166247",   "American Viticultural Area"),
@@ -44,6 +51,7 @@ WINE_REGION_CLASSES = [
     ("docg",               "Q2305591",  "DOCG"),
     ("aop_ch",             "Q20723149", "appellation d'origine protégée (CH)"),
     ("appellation",        "Q2858704",  "appellation (legally-defined)"),
+    ("vineyard",           "Q22715",    "vineyard (covers many AOCs in Wikidata)"),
 ]
 
 

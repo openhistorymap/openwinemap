@@ -305,7 +305,7 @@ def harvest_wd_regions(manifest):
         "file": "regions.geojson",
         "count": len(features),
         "updated_at": now,
-        "queried_classes": [name for name, _ in WINE_REGION_CLASSES],
+        "queried_classes": [c[0] for c in WINE_REGION_CLASSES],
     }
     if failed:
         entry["failed_classes"] = failed
@@ -320,8 +320,20 @@ def main():
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     manifest = {"generated_at": now, "countries": [], "regions": None}
 
-    harvest_osm(manifest)
-    harvest_wd_regions(manifest)
+    # Each phase has its own try/except, but wrap the whole thing too so the
+    # manifest still lands on disk if something unexpected blows up later —
+    # otherwise the OSM data on disk gets orphaned from the manifest and the
+    # bot never commits it.
+    try:
+        harvest_osm(manifest)
+    except Exception as e:
+        print(f"!! OSM phase crashed: {e!r}", flush=True)
+        manifest.setdefault("errors", []).append({"phase": "osm", "error": str(e)})
+    try:
+        harvest_wd_regions(manifest)
+    except Exception as e:
+        print(f"!! Wikidata phase crashed: {e!r}", flush=True)
+        manifest.setdefault("errors", []).append({"phase": "wd_regions", "error": str(e)})
 
     with (DATA_DIR / "manifest.json").open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
