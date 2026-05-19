@@ -20,6 +20,11 @@ def categorize(tags):
         return "winery"
     if tags.get("landuse") == "vineyard":
         return "vineyard"
+    # `crop=grape` is the alternative tagging style (often paired with
+    # landuse=farmland or landuse=orchard) used outside the
+    # landuse=vineyard convention. Treat it as the same category.
+    if tags.get("crop") == "grape":
+        return "vineyard"
     if tags.get("tourism") == "wine_cellar" or tags.get("man_made") == "wine_cellar":
         return "wine_cellar"
     amenity = tags.get("amenity")

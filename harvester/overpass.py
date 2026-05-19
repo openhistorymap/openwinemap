@@ -18,6 +18,7 @@ area["ISO3166-1"="{cc}"][admin_level=2]->.a;
   nwr["industrial"="winery"](area.a);
   nwr["building"="winery"](area.a);
   nwr["landuse"="vineyard"](area.a);
+  nwr["crop"="grape"](area.a);
   nwr["tourism"="wine_cellar"](area.a);
   nwr["man_made"="wine_cellar"](area.a);
   nwr["amenity"="wine_bar"](area.a);

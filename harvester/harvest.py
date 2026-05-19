@@ -39,7 +39,7 @@ COUNTRY_DIR = DATA_DIR / "countries"
 
 KEEP_TAGS = {
     "name", "name:en", "alt_name", "official_name",
-    "craft", "industrial", "building", "landuse",
+    "craft", "industrial", "building", "landuse", "crop",
     "shop", "amenity", "cuisine", "tourism", "man_made",
     "wikidata", "wikipedia", "image", "website", "url",
     "opening_hours", "phone", "email", "operator", "brand",
