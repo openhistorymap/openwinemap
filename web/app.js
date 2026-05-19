@@ -77,6 +77,7 @@ const MAP_STYLES = {
 
 const SOURCE_ID = "owm-pois";
 const AREAS_SOURCE_ID = "owm-areas";
+const VHEAT_SOURCE_ID = "owm-vineyards-heat";
 
 const state = {
   manifest: null,
@@ -84,6 +85,7 @@ const state = {
   features: [],             // current country OSM features
   regions: [],              // global wine-region features (always loaded)
   enabled: new Set(ALL_CATEGORIES),
+  expanded: new Set(),      // category rows currently showing their item list
   theme: document.documentElement.getAttribute("data-theme") || "light",
   selectedFeatureId: null,
   youAreHereMarker: null,
@@ -171,16 +173,60 @@ function addCustomLayers() {
     map.getSource(AREAS_SOURCE_ID).setData(featureCollection(split.areas));
   }
 
+  if (!map.getSource(VHEAT_SOURCE_ID)) {
+    map.addSource(VHEAT_SOURCE_ID, {
+      type: "geojson",
+      data: featureCollection(split.vheat),
+    });
+  } else {
+    map.getSource(VHEAT_SOURCE_ID).setData(featureCollection(split.vheat));
+  }
+
   const palette = currentPalette();
   const clusterFill = readVarColor("--map-cluster-fill");
   const clusterStroke = readVarColor("--map-cluster-stroke");
   const clusterText = readVarColor("--map-cluster-text");
   const dotStroke = state.theme === "dark" ? "rgba(20,12,12,0.7)" : "rgba(255,250,240,0.85)";
 
-  // Polygon fill + outline must go *under* the symbol/circle layers so the
-  // glyphs sit on top of their footprint. MapLibre inserts layers above all
-  // existing ones unless you pass a `before` id, so add fills first then
-  // re-add the point layers if they're missing.
+  // Layer stack from bottom to top:
+  //   1. vineyard heatmap (only visible at z<10 — fades out as polygons take over)
+  //   2. polygon fills
+  //   3. polygon outlines
+  //   4. cluster circles
+  //   5. point dots (only for *non-polygon* points, see filter)
+  //   6. point symbols (icons) — sit on polygon centroids when applicable
+  //   7. cluster count labels
+  if (!map.getLayer("owm-vineyard-heat")) {
+    map.addLayer({
+      id: "owm-vineyard-heat",
+      type: "heatmap",
+      source: VHEAT_SOURCE_ID,
+      maxzoom: 10,
+      paint: {
+        "heatmap-weight": 1,
+        "heatmap-intensity": [
+          "interpolate", ["linear"], ["zoom"],
+          0, 0.4, 5, 0.9, 8, 1.4, 10, 0,
+        ],
+        "heatmap-color": [
+          "interpolate", ["linear"], ["heatmap-density"],
+          0,   "rgba(0,0,0,0)",
+          0.15, state.theme === "dark" ? "rgba(232,159,116,0.18)" : "rgba(125,31,42,0.18)",
+          0.45, state.theme === "dark" ? "rgba(220,118,80,0.40)"  : "rgba(125,31,42,0.42)",
+          0.80, state.theme === "dark" ? "rgba(232,122,134,0.60)" : "rgba(125,31,42,0.65)",
+        ],
+        "heatmap-radius": [
+          "interpolate", ["linear"], ["zoom"],
+          0, 6, 5, 14, 8, 22, 10, 0,
+        ],
+        "heatmap-opacity": [
+          "interpolate", ["linear"], ["zoom"],
+          0, 0.85, 6, 0.85, 8, 0.65, 10, 0,
+        ],
+      },
+    });
+  }
+
   if (!map.getLayer("owm-areas-fill")) {
     map.addLayer({
       id: "owm-areas-fill",
@@ -190,7 +236,7 @@ function addCustomLayers() {
         "fill-color": colorExpr(palette),
         "fill-opacity": [
           "interpolate", ["linear"], ["zoom"],
-          6, 0.10, 10, 0.22, 14, 0.32, 18, 0.40,
+          6, 0.18, 10, 0.32, 14, 0.42, 18, 0.50,
         ],
       },
     });
@@ -202,9 +248,9 @@ function addCustomLayers() {
         "line-color": colorExpr(palette),
         "line-width": [
           "interpolate", ["linear"], ["zoom"],
-          8, 0.4, 12, 0.8, 16, 1.3, 18, 1.8,
+          6, 0.7, 10, 1.1, 14, 1.7, 18, 2.4,
         ],
-        "line-opacity": 0.85,
+        "line-opacity": 0.95,
       },
     });
   } else {
@@ -212,12 +258,20 @@ function addCustomLayers() {
     map.setPaintProperty("owm-areas-outline", "line-color", colorExpr(palette));
   }
 
+  // Suppress the dot for centroid points that already have a polygon under
+  // them — the polygon + icon combination reads cleanly; a third mark in the
+  // middle is noise.
+  const pointDotFilter = [
+    "all",
+    ["!", ["has", "point_count"]],
+    ["!=", ["coalesce", ["get", "has_area"], false], true],
+  ];
   if (!map.getLayer("owm-points-dot")) {
     map.addLayer({
       id: "owm-points-dot",
       type: "circle",
       source: SOURCE_ID,
-      filter: ["!", ["has", "point_count"]],
+      filter: pointDotFilter,
       paint: {
         "circle-color": colorExpr(palette),
         "circle-radius": [
@@ -232,6 +286,7 @@ function addCustomLayers() {
   } else {
     map.setPaintProperty("owm-points-dot", "circle-color", colorExpr(palette));
     map.setPaintProperty("owm-points-dot", "circle-stroke-color", dotStroke);
+    map.setFilter("owm-points-dot", pointDotFilter);
   }
 
   if (!map.getLayer("owm-points")) {
@@ -360,33 +415,96 @@ function filteredFeatures() {
   return out;
 }
 
-// Split the filtered feature set into the two MapLibre sources we maintain:
-// a clustered point source (one Point per feature — centroid for polygons)
-// and an unclustered polygon source for fill rendering. Centroids are an
-// unweighted mean of vertex coordinates — good enough for symbol placement;
-// not a geodesic centroid.
+// Split the filtered feature set into the three MapLibre sources we maintain:
+// a clustered point source (one Point per feature — centroid for polygons,
+// marked with `has_area: true` so the dot layer can suppress them and let the
+// symbol icon sit on the polygon alone); an unclustered polygon source for
+// fill rendering; and an unclustered vineyard-only source feeding the
+// low-zoom heatmap, which exists purely so a country-zoom view conveys
+// "this is wine country" without needing every dot to render.
 function splitFeatures(features) {
   const points = [];
   const areas = [];
+  const vheat = [];
   for (const f of features) {
     const g = f.geometry;
     if (!g) continue;
+    const cat = normalizeCat(f.properties.category);
     if (g.type === "Point") {
       points.push(f);
+      if (cat === "vineyard") {
+        vheat.push({
+          type: "Feature",
+          geometry: g,
+          properties: {},
+        });
+      }
       continue;
     }
     areas.push(f);
     const c = polygonCentroid(g);
-    if (c) {
-      points.push({
+    if (!c) continue;
+    points.push({
+      type: "Feature",
+      id: f.id,
+      geometry: { type: "Point", coordinates: c },
+      properties: { ...f.properties, has_area: true },
+    });
+    if (cat === "vineyard") {
+      vheat.push({
         type: "Feature",
-        id: f.id,
         geometry: { type: "Point", coordinates: c },
-        properties: f.properties,
+        properties: {},
       });
     }
   }
-  return { points, areas };
+  return { points, areas, vheat };
+}
+
+// Polygon area in hectares. Equirectangular approximation around each
+// polygon's mean latitude — good to a few percent at the latitudes wine is
+// actually grown at; we're not going to mistake an acre for a megahectare.
+function geomAreaHa(geom) {
+  if (!geom || (geom.type !== "Polygon" && geom.type !== "MultiPolygon")) return 0;
+  const polys = geom.type === "Polygon" ? [geom.coordinates] : geom.coordinates;
+  let total = 0;
+  for (const poly of polys) {
+    if (!poly.length) continue;
+    const outer = poly[0];
+    if (outer.length < 3) continue;
+    let latSum = 0;
+    for (const [, y] of outer) latSum += y;
+    const lat0 = latSum / outer.length;
+    const cos = Math.cos(lat0 * Math.PI / 180);
+    const mDegLon = 111320 * cos;
+    const mDegLat = 110540;
+    let s = 0;
+    for (let i = 0; i < outer.length - 1; i++) {
+      s += outer[i][0] * outer[i + 1][1] - outer[i + 1][0] * outer[i][1];
+    }
+    total += Math.abs(s) * mDegLon * mDegLat / 2;
+    // Subtract inner rings (holes). We don't drop holes everywhere — the
+    // harvester does, but defensive in case future data carries them.
+    for (let r = 1; r < poly.length; r++) {
+      const ring = poly[r];
+      if (ring.length < 3) continue;
+      let h = 0;
+      for (let i = 0; i < ring.length - 1; i++) {
+        h += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1];
+      }
+      total -= Math.abs(h) * mDegLon * mDegLat / 2;
+    }
+  }
+  return Math.max(0, total / 10000);
+}
+
+function formatArea(ha) {
+  if (!ha) return "";
+  if (ha < 0.1) return `${Math.round(ha * 10000)} m²`;
+  if (ha < 10) return `${ha.toFixed(2)} ha`;
+  if (ha < 100) return `${ha.toFixed(1)} ha`;
+  if (ha < 10000) return `${Math.round(ha).toLocaleString()} ha`;
+  return `${(ha / 100).toFixed(0)} km²`;
 }
 
 function polygonCentroid(geom) {
@@ -636,6 +754,8 @@ function fitToCountry() {
   );
 }
 
+const CAT_LIST_LIMIT = 250;
+
 function renderCategories() {
   const container = document.getElementById("cat-list");
   container.innerHTML = "";
@@ -650,18 +770,37 @@ function renderCategories() {
     const row = document.createElement("div");
     row.className = "cat-row" + (state.enabled.has(k) ? "" : " off");
     row.dataset.cat = k;
+    const isOpen = state.expanded.has(k);
     row.innerHTML = `
       <span class="cat-glyph" style="color:${palette[k]}">${inlineGlyph(k)}</span>
       <span class="cat-label">${CATEGORY_LABELS[k] || k}</span>
       <span class="cat-count">${counts[k].toLocaleString()}</span>
+      <button class="cat-expand${isOpen ? " open" : ""}" aria-label="show items" type="button">
+        <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 4.5 L6 8.5 L10 4.5" /></svg>
+      </button>
     `;
+
+    // Clicking the row toggles enabled/disabled; clicking the chevron
+    // toggles the item list. The chevron stops propagation so the two
+    // affordances don't trip each other.
     row.addEventListener("click", () => {
       if (state.enabled.has(k)) state.enabled.delete(k);
       else state.enabled.add(k);
       row.classList.toggle("off");
       applyFilter();
     });
+    const expandBtn = row.querySelector(".cat-expand");
+    expandBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (state.expanded.has(k)) state.expanded.delete(k);
+      else state.expanded.add(k);
+      renderCategories();
+    });
     container.appendChild(row);
+
+    if (isOpen) {
+      container.appendChild(buildCatItemList(k));
+    }
   }
 
   document.getElementById("cat-all").onclick = () => {
@@ -676,6 +815,88 @@ function renderCategories() {
   };
 }
 
+// Build the named-item list shown when a category is expanded. Unnamed
+// features (raw landuse=vineyard polygons with no tag-name) are counted in
+// the row above but not listed — they're not navigable.
+function buildCatItemList(category) {
+  const items = [];
+  if (category === "wine_region") {
+    for (const f of state.regions) {
+      const name = f.properties && f.properties.name;
+      if (name && name !== f.properties.qid) items.push(f);
+    }
+  } else {
+    for (const f of state.features) {
+      if (normalizeCat(f.properties.category) !== category) continue;
+      const name = f.properties && f.properties.name;
+      if (name) items.push(f);
+    }
+  }
+  items.sort((a, b) =>
+    String(a.properties.name).localeCompare(String(b.properties.name), undefined, { sensitivity: "base" })
+  );
+
+  const list = document.createElement("div");
+  list.className = "cat-itemlist";
+
+  if (!items.length) {
+    list.innerHTML = `<div class="cat-item-empty">no named items in this category</div>`;
+    return list;
+  }
+
+  const shown = items.slice(0, CAT_LIST_LIMIT);
+  const frag = document.createDocumentFragment();
+  for (const f of shown) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cat-item";
+    btn.dataset.id = f.id;
+    btn.textContent = f.properties.name;
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      zoomToFeature(f);
+      openDetail(f);
+    });
+    frag.appendChild(btn);
+  }
+  list.appendChild(frag);
+  if (items.length > CAT_LIST_LIMIT) {
+    const more = document.createElement("div");
+    more.className = "cat-item-more";
+    more.textContent = `… and ${(items.length - CAT_LIST_LIMIT).toLocaleString()} more named items (zoom in to find them)`;
+    list.appendChild(more);
+  }
+  return list;
+}
+
+function zoomToFeature(f) {
+  if (!f || !f.geometry) return;
+  if (f.geometry.type === "Point") {
+    state.suppressNextMoveUrlWrite = true;
+    map.flyTo({ center: f.geometry.coordinates, zoom: Math.max(map.getZoom(), 13), duration: 800 });
+    return;
+  }
+  // Polygon / MultiPolygon: fit to its bounding box
+  let minLon = Infinity, minLat = Infinity, maxLon = -Infinity, maxLat = -Infinity;
+  const walk = (coords) => {
+    if (typeof coords[0] === "number") {
+      if (coords[0] < minLon) minLon = coords[0];
+      if (coords[0] > maxLon) maxLon = coords[0];
+      if (coords[1] < minLat) minLat = coords[1];
+      if (coords[1] > maxLat) maxLat = coords[1];
+    } else {
+      for (const c of coords) walk(c);
+    }
+  };
+  walk(f.geometry.coordinates);
+  if (!isFinite(minLon)) return;
+  state.suppressNextMoveUrlWrite = true;
+  map.fitBounds(
+    [[minLon, minLat], [maxLon, maxLat]],
+    { padding: 80, duration: 800, maxZoom: 16 },
+  );
+}
+
 function inlineGlyph(k) {
   const d = GLYPH_PATHS[k] || GLYPH_PATHS.winery;
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${d}" fill="currentColor" fill-rule="evenodd"/></svg>`;
@@ -688,6 +909,8 @@ function applyFilter() {
   src.setData(featureCollection(split.points));
   const areas = map.getSource(AREAS_SOURCE_ID);
   if (areas) areas.setData(featureCollection(split.areas));
+  const heat = map.getSource(VHEAT_SOURCE_ID);
+  if (heat) heat.setData(featureCollection(split.vheat));
 }
 
 // ── Detail panel ──────────────────────────────────────────────
@@ -718,14 +941,17 @@ function renderOsmDetail(body, feature, category, catLabel) {
   const tags = parseTags(p.tags);
   const addr = formatAddress(tags);
   const links = buildOsmLinks(p, tags);
+  const areaHa = geomAreaHa(feature.geometry);
+  const subLine = addr || tags["addr:city"] || "";
+  const areaLine = areaHa ? formatArea(areaHa) : "";
 
   body.innerHTML = `
     <span class="detail-cat">
       <span class="cat-glyph">${inlineGlyph(category)}</span>
-      ${escapeHtml(catLabel.toLowerCase())}
+      ${escapeHtml(catLabel.toLowerCase())}${areaLine ? ` · ${escapeHtml(areaLine)}` : ""}
     </span>
     <h2 class="detail-title">${escapeHtml(p.name || "(unnamed)")}</h2>
-    <div class="detail-sub">${escapeHtml(addr || tags["addr:city"] || "")}</div>
+    <div class="detail-sub">${escapeHtml(subLine)}</div>
     <div id="wd-slot"></div>
     <div class="detail-section">
       <h4>From OpenStreetMap</h4>
